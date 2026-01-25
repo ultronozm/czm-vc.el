@@ -49,6 +49,37 @@
 (defvar embark-keymap-alist)
 (defvar embark-target-finders)
 
+;; Internal helpers
+(defun czm-vc--assert-git-working-tree (&optional dir)
+  "Signal an error unless DIR (or `default-directory') is in a Git worktree."
+  (require 'vc)
+  (let* ((dir (or dir default-directory))
+         (backend (ignore-errors (vc-responsible-backend dir))))
+    (unless (eq backend 'Git)
+      (user-error "Not in a Git working tree"))))
+
+(defun czm-vc--assert-safe-git-revision (rev &optional buffer)
+  "Return REV trimmed, after basic safety checks and `git rev-parse --verify'."
+  (require 'vc-git)
+  (czm-vc--assert-git-working-tree)
+  (let ((trimmed (string-trim (or rev ""))))
+    (when (string-empty-p trimmed)
+      (user-error "Empty revision"))
+    ;; Disallow leading '-' to avoid Git option injection in revision positions.
+    (when (string-prefix-p "-" trimmed)
+      (user-error "Invalid revision (must not start with '-')"))
+    ;; Disallow whitespace/control chars which can confuse command argument parsing.
+    (when (string-match-p "[[:space:]\n\r]" trimmed)
+      (user-error "Invalid revision (must not contain whitespace)"))
+    (let ((status (vc-git-command buffer t nil
+                                  "rev-parse" "--verify" "--"
+                                  (format "%s^{commit}" trimmed))))
+      (unless (zerop status)
+        (when (bufferp buffer) (pop-to-buffer buffer))
+        (user-error "Not a commit-ish: %s" trimmed)))
+    trimmed))
+
+;;;###autoload
 (defun czm-vc-project-format-patch-last-commit (&optional arg)
   "Create a patch file from the last commit in the current project.
 With prefix argument ARG, prompt for a specific commit.
@@ -62,8 +93,10 @@ The patch is saved in the project root directory and opened in a buffer."
          (commit (if arg
                      (vc-read-revision "Format patch from commit: " nil 'Git "HEAD")
                    "HEAD")))
+    (czm-vc--assert-git-working-tree root)
     (when (vc-git--empty-db-p)
       (user-error "No commits exist in this Git repository"))
+    (setq commit (czm-vc--assert-safe-git-revision commit))
     (message "Generating patch from %s..." commit)
     (let ((filename
            (string-trim
@@ -75,6 +108,7 @@ The patch is saved in the project root directory and opened in a buffer."
       (diff-mode)
       (message "Patch saved as %s" filename))))
 
+;;;###autoload
 (defun czm-vc-create-directory-with-git-repo (dir)
   "Create directory DIR, initialize a Git repository, and open it in Dired."
   (interactive
@@ -87,6 +121,7 @@ The patch is saved in the project root directory and opened in a buffer."
     (vc-create-repo 'Git)
     (dired default-directory)))
 
+;;;###autoload
 (defun czm-vc-diff-dired-changed-files ()
   "Open Dired showing files mentioned in the current Diff buffer."
   (interactive)
@@ -104,6 +139,7 @@ The patch is saved in the project root directory and opened in a buffer."
         (dired (cons root (nreverse files)))
       (user-error "No files found in diff"))))
 
+;;;###autoload
 (defun czm-vc-git-drop-whitespace-changes ()
   "Revert whitespace-only edits in the current buffer's file."
   (interactive)
@@ -111,21 +147,43 @@ The patch is saved in the project root directory and opened in a buffer."
   (require 'vc-git)
   (let ((file (buffer-file-name)))
     (unless file (user-error "Buffer not visiting a file"))
+    (when (buffer-modified-p)
+      (user-error "Save the buffer before dropping whitespace-only changes"))
+    (czm-vc--assert-git-working-tree file)
+    (let ((staged-status (vc-git-command nil 1 nil "diff" "--cached" "--quiet" "--" file)))
+      (when (= staged-status 1)
+        (user-error "File has staged changes; aborting")))
     (let ((patch (vc-git--run-command-string file "diff" "-w" "HEAD" "--" file))
           (vc-revert-show-diff nil)
           (vc-suppress-confirm t))
       (if (string-empty-p patch)
           (message "No non-whitespace edits to keep")
-        (vc-revert)
-        (let ((patch-file (make-nearby-temp-file "vc-drop-white-")))
+        (let* ((backup (with-temp-buffer
+                         (insert-file-contents file)
+                         (buffer-string)))
+               (patch-file (make-nearby-temp-file "vc-drop-white-")))
           (unwind-protect
               (progn
                 (with-temp-file patch-file (insert patch))
-                (vc-git-command nil t file "apply" (file-local-name patch-file))
-                (vc-git-command nil t file "apply" "--cached"
-                                (file-local-name patch-file)))
+                (unless (zerop (vc-git-command nil t file "apply" "--check" "--"
+                                               (file-local-name patch-file)))
+                  (user-error "Patch would not apply cleanly; aborting"))
+                (vc-revert)
+                (unless (zerop (vc-git-command nil t file "apply" "--"
+                                               (file-local-name patch-file)))
+                  (let ((inhibit-read-only t))
+                    (erase-buffer)
+                    (insert backup)
+                    (write-region (point-min) (point-max) file nil 0)
+                    (set-buffer-modified-p nil))
+                  (user-error "Failed to apply patch; restored original file"))
+                (unless (zerop (vc-git-command nil t file "apply" "--cached" "--"
+                                               (file-local-name patch-file)))
+                  (user-error "Failed to stage non-whitespace changes"))
+                (revert-buffer nil t))
             (delete-file patch-file)))))))
 
+;;;###autoload
 (defun czm-vc-root-shortlog-all (&optional limit)
   "Show a one-line, graph-style Git log across all branches.
 With numeric prefix argument LIMIT, show that many commits
@@ -137,6 +195,7 @@ The default is `vc-log-show-limit' if > 0."
     ;; For a repo root this automatically gives the short view.
     (vc-print-root-log limit)))
 
+;;;###autoload
 (defun czm-vc-dir-dired-marked ()
   "Open Dired with marked files in `vc-dir' (or file at point)."
   (interactive)
@@ -147,17 +206,21 @@ The default is `vc-log-show-limit' if > 0."
         (user-error "No files marked or at point")
       (dired (cons default-directory files)))))
 
+;;;###autoload
 (defun czm-vc-embark-show-commit (commit)
   "Show COMMIT via `vc-print-branch-log', constraining it to COMMIT^!."
   (interactive (list (or (thing-at-point 'symbol t)
                          (read-string "Commit: "))))
   (require 'vc)
-  (let* ((trimmed (string-trim commit))
+  (let* ((root (or (ignore-errors (vc-root-dir)) default-directory))
+         (default-directory root)
+         (trimmed (czm-vc--assert-safe-git-revision commit))
          (range (if (string-suffix-p "^!" trimmed)
                     trimmed
                   (concat trimmed "^!"))))
     (vc-print-branch-log range)))
 
+;;;###autoload
 (defun czm-vc-embark-copy-commit (commit)
   "Copy COMMIT to the kill ring."
   (interactive (list (or (thing-at-point 'symbol t)
@@ -171,6 +234,7 @@ The default is `vc-log-show-limit' if > 0."
     (when (and s (string-match-p "\\`[0-9a-f]\\{7,40\\}\\'" s))
       (cons 'git-commit s))))
 
+;;;###autoload
 (defun czm-vc-embark-setup ()
   "Set up Embark targets/actions for Git commits."
   (require 'embark)
@@ -185,6 +249,7 @@ The default is `vc-log-show-limit' if > 0."
   (add-to-list 'embark-keymap-alist
                '(git-commit . czm-vc-embark-git-commit-map)))
 
+;;;###autoload
 (defun czm-vc-diff-staged ()
   "Show Git staged changes (\"git diff --cached\")."
   (interactive)
@@ -222,6 +287,7 @@ If called from `log-view-mode', default to `log-view-current-tag'."
                    "Fixup commit: ")
                  nil nil default)))
 
+;;;###autoload
 (defun czm-vc-git-fixup-staged (commit)
   "Create a Git fixup commit for COMMIT using staged changes, then autosquash.
 Roughly, it runs:
@@ -236,6 +302,8 @@ Roughly, it runs:
          (buf (get-buffer-create "*vc-git-fixup*")))
     (unless (eq backend 'Git)
       (user-error "Not in a Git working tree"))
+    (let ((default-directory root))
+      (setq commit (czm-vc--assert-safe-git-revision commit buf)))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)))
@@ -250,7 +318,8 @@ Roughly, it runs:
       (when (fboundp 'vc-git--assert-allowed-rewrite)
         (vc-git--assert-allowed-rewrite commit))
 
-      (when (zerop (vc-git-command buf t nil "rev-parse" (format "%s^2" commit)))
+      (when (zerop (vc-git-command buf t nil "rev-parse" "--verify" "--"
+                                   (format "%s^2" commit)))
         (pop-to-buffer buf)
         (error "Cannot autosquash fixup commits onto merge commits"))
 
@@ -260,7 +329,7 @@ Roughly, it runs:
                  (vc-git-command standard-output 0 nil
                                  "log" "--oneline" "-E"
                                  "--grep" "^(squash|fixup|amend)! "
-                                 (format "%s~1.." commit))))))
+                                 "--" (format "%s~1.." commit))))))
         (when (and (length> existing 0)
                    (not (yes-or-no-p
                          "Rebase may --autosquash your other squash!/fixup!/amend!; proceed? ")))
@@ -273,7 +342,7 @@ Roughly, it runs:
           (error "Git commit --fixup failed (%s)" status)))
 
       (let ((status (vc-git-command buf t nil
-                                    "rev-parse" "--verify" (format "%s~1" commit))))
+                                    "rev-parse" "--verify" "--" (format "%s~1" commit))))
         (unless (zerop status)
           (pop-to-buffer buf)
           (error "Cannot autosquash: %s has no parent (root commit?)" commit)))
@@ -289,5 +358,6 @@ Roughly, it runs:
       (message "Fixup + autosquash complete for %s" commit)
       (when (derived-mode-p 'log-view-mode)
         (revert-buffer nil t)))))
+
 (provide 'czm-vc)
 ;;; czm-vc.el ends here
