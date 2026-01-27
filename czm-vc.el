@@ -29,7 +29,7 @@
 (declare-function vc-git--run-command-string "vc-git" (file &rest args))
 (declare-function vc-git-command "vc-git" (buffer okstatus file-or-list &rest flags))
 (declare-function vc-git--assert-allowed-rewrite "vc-git" (rev))
-(declare-function vc-git--call "vc-git" (buffer okstatus file &rest args))
+(declare-function vc-git--call "vc-git" (infile buffer command &rest args))
 (declare-function vc-git--empty-db-p "vc-git" ())
 (declare-function vc-create-repo "vc" (backend &optional directory))
 (declare-function vc-read-revision "vc" (prompt &optional files backend default initial-input))
@@ -58,11 +58,14 @@
     (unless (eq backend 'Git)
       (user-error "Not in a Git working tree"))))
 
-(defun czm-vc--assert-safe-git-revision (rev &optional buffer)
-  "Return REV trimmed, after basic safety checks and `git rev-parse --verify'."
+(defun czm-vc--assert-safe-git-revision (rev &optional buffer dir)
+  "Return REV trimmed, after basic safety checks and `git rev-parse --verify'.
+When DIR is non-nil, run Git commands from that directory."
   (require 'vc-git)
-  (czm-vc--assert-git-working-tree)
-  (let ((trimmed (string-trim (or rev ""))))
+  (let* ((dir (or dir default-directory))
+         (default-directory (file-name-as-directory (expand-file-name dir)))
+         (trimmed (string-trim (or rev ""))))
+    (czm-vc--assert-git-working-tree dir)
     (when (string-empty-p trimmed)
       (user-error "Empty revision"))
     ;; Disallow leading '-' to avoid Git option injection in revision positions.
@@ -71,12 +74,28 @@
     ;; Disallow whitespace/control chars which can confuse command argument parsing.
     (when (string-match-p "[[:space:]\n\r]" trimmed)
       (user-error "Invalid revision (must not contain whitespace)"))
-    (let ((status (vc-git-command buffer t nil
-                                  "rev-parse" "--verify" "--"
-                                  (format "%s^{commit}" trimmed))))
-      (unless (zerop status)
-        (when (bufferp buffer) (pop-to-buffer buffer))
-        (user-error "Not a commit-ish: %s" trimmed)))
+    ;; Allow either a single commit-ish (e.g. HEAD~6) or a revision range
+    ;; (e.g. HEAD~6..HEAD).  For ranges, verify both endpoints.
+    ;;
+    ;; Use `vc-git--call' directly so we don't accidentally append FILE-OR-LIST
+    ;; arguments (which can break verification in some setups).
+    (let ((range-pos (string-match "\\.\\.\\.?" trimmed)))
+      (if (not range-pos)
+          (let ((status (vc-git--call nil buffer "rev-parse" "--verify"
+                                      (format "%s^{commit}" trimmed))))
+            (unless (zerop status)
+              (when (bufferp buffer) (pop-to-buffer buffer))
+              (user-error "Not a commit-ish: %s" trimmed)))
+        (let ((lhs (substring trimmed 0 range-pos))
+              (rhs (substring trimmed (match-end 0))))
+          (when (or (string-empty-p lhs) (string-empty-p rhs))
+            (user-error "Revision range must specify both ends: %s" trimmed))
+          (dolist (end (list lhs rhs))
+            (let ((status (vc-git--call nil buffer "rev-parse" "--verify"
+                                        (format "%s^{commit}" end))))
+              (unless (zerop status)
+                (when (bufferp buffer) (pop-to-buffer buffer))
+                (user-error "Not a commit-ish: %s" end)))))))
     trimmed))
 
 ;;;###autoload
@@ -91,19 +110,27 @@ The patch is saved in the project root directory and opened in a buffer."
          (root (project-root project))
          (default-directory root)
          (commit (if arg
-                     (vc-read-revision "Format patch from commit: " nil 'Git "HEAD")
+                     (vc-read-revision "Format patch from (commit/range): " nil 'Git "HEAD")
                    "HEAD")))
     (czm-vc--assert-git-working-tree root)
     (when (vc-git--empty-db-p)
       (user-error "No commits exist in this Git repository"))
-    (setq commit (czm-vc--assert-safe-git-revision commit))
+    ;; Only verify user-provided revisions.  For the default `HEAD', let
+    ;; `git format-patch' be the source of truth.
+    (when arg
+      (setq commit (czm-vc--assert-safe-git-revision commit nil root)))
     (message "Generating patch from %s..." commit)
     (let ((filename
            (string-trim
             (with-temp-buffer
-              (if (zerop (vc-git--call nil t root "format-patch" "-1" commit))
+              (if (zerop
+                   (if (string-match-p "\\.\\.\\.?" commit)
+                       (vc-git--call nil t "format-patch" commit)
+                     (vc-git--call nil t "format-patch" "-1" commit)))
                   (buffer-string)
                 (user-error "Failed to generate patch from %s" commit))))))
+      (when (string-empty-p filename)
+        (user-error "git format-patch produced no output; no patch file created"))
       (find-file (expand-file-name filename root))
       (diff-mode)
       (message "Patch saved as %s" filename))))
