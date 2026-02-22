@@ -41,6 +41,8 @@
 (declare-function vc-dir-current-file "vc-dir" ())
 (declare-function vc-dir-marked-files "vc-dir" ())
 (declare-function log-view-current-tag "log-view" ())
+(declare-function log-view-current-entry "log-view" (&optional pos move))
+(declare-function log-view-copy-revision-as-kill "log-view" ())
 (declare-function project-root "project" (project))
 
 (defvar vc-git-shortlog-switches)
@@ -232,6 +234,20 @@ The default is `vc-log-show-limit' if > 0."
     (if (null files)
         (user-error "No files marked or at point")
       (dired (cons default-directory files)))))
+
+;;;###autoload
+(defun czm-vc-log-view-copy-revision-or-range-as-kill ()
+  "Copy commit at point, or copy commit range when region is active."
+  (interactive)
+  (if-let* ((_region (use-region-p))
+            (top (cadr (log-view-current-entry (region-beginning))))
+            (bottom (cadr (log-view-current-entry (region-end))))
+            ((not (equal top bottom))))
+      (let ((range (format "%s..%s" bottom top)))
+        (deactivate-mark)
+        (kill-new range)
+        (message "Copied \"%s\" to kill ring." range))
+    (log-view-copy-revision-as-kill)))
 
 ;;;###autoload
 (defun czm-vc-embark-show-commit (commit)
