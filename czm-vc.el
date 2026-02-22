@@ -330,13 +330,22 @@ If called from `log-view-mode', default to `log-view-current-tag'."
                    "Fixup commit: ")
                  nil nil default)))
 
+;; Git helpers
+(defun czm-vc-git--commit-parents (commit)
+  "Return a list of parent commits for COMMIT."
+  (require 'vc-git)
+  (let* ((s (vc-git--run-command-string nil "show" "-s" "--format=%P" commit))
+         (s (string-trim (or s ""))))
+    (if (string-empty-p s) nil (split-string s " " t))))
+
 ;;;###autoload
 (defun czm-vc-git-fixup-staged (commit)
   "Create a Git fixup commit for COMMIT using staged changes, then autosquash.
 Roughly, it runs:
   git diff --cached --quiet
   git commit --fixup=COMMIT --no-edit
-  GIT_SEQUENCE_EDITOR=true git rebase --autostash --autosquash -i COMMIT~1"
+  GIT_SEQUENCE_EDITOR=true git rebase --autostash --autosquash -i BASE
+where BASE is COMMIT's parent, or `--root' if COMMIT is a root commit."
   (interactive (list (czm-vc-git--read-fixup-commit)))
   (require 'vc)
   (require 'vc-git)
@@ -346,11 +355,11 @@ Roughly, it runs:
     (unless (eq backend 'Git)
       (user-error "Not in a Git working tree"))
     (let ((default-directory root))
-      (setq commit (czm-vc--assert-safe-git-revision commit buf)))
-    (with-current-buffer buf
-      (let ((inhibit-read-only t))
-        (erase-buffer)))
-    (let ((default-directory root))
+      (setq commit (czm-vc--assert-safe-git-revision commit buf))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)))
+
       (let ((staged-status (vc-git-command buf 1 nil "diff" "--cached" "--quiet")))
         (cond
          ((= staged-status 0) (user-error "No staged changes"))
@@ -361,46 +370,46 @@ Roughly, it runs:
       (when (fboundp 'vc-git--assert-allowed-rewrite)
         (vc-git--assert-allowed-rewrite commit))
 
-      (when (zerop (vc-git-command buf t nil "rev-parse" "--verify" "--"
-                                   (format "%s^2" commit)))
-        (pop-to-buffer buf)
-        (error "Cannot autosquash fixup commits onto merge commits"))
-
-      (let ((existing
-             (with-output-to-string
-               (with-current-buffer standard-output
-                 (vc-git-command standard-output 0 nil
-                                 "log" "--oneline" "-E"
-                                 "--grep" "^(squash|fixup|amend)! "
-                                 "--" (format "%s~1.." commit))))))
-        (when (and (length> existing 0)
-                   (not (yes-or-no-p
-                         "Rebase may --autosquash your other squash!/fixup!/amend!; proceed? ")))
-          (user-error "Aborted")))
-
-      (let ((status (vc-git-command buf 0 nil
-                                    "commit" (format "--fixup=%s" commit) "--no-edit")))
-        (unless (zerop status)
+      (let* ((parents (czm-vc-git--commit-parents commit))
+             (base (pcase (length parents)
+                     (0 :root)
+                     (1 (car parents))
+                     (_ :merge))))
+        (when (eq base :merge)
           (pop-to-buffer buf)
-          (error "Git commit --fixup failed (%s)" status)))
+          (error "Cannot autosquash fixup commits onto merge commits"))
 
-      (let ((status (vc-git-command buf t nil
-                                    "rev-parse" "--verify" "--" (format "%s~1" commit))))
-        (unless (zerop status)
-          (pop-to-buffer buf)
-          (error "Cannot autosquash: %s has no parent (root commit?)" commit)))
+        (let ((existing
+               (with-output-to-string
+                 (with-current-buffer standard-output
+                   (apply #'vc-git-command standard-output 0 nil
+                          "log" "--oneline" "-E"
+                          "--grep" "^(squash|fixup|amend)! "
+                          (if (eq base :root)
+                              nil
+                            (list (format "%s.." base))))))))
+          (when (and (length> existing 0)
+                     (not (yes-or-no-p
+                           "Rebase may --autosquash your other squash!/fixup!/amend!; proceed? ")))
+            (user-error "Aborted")))
 
-      (with-environment-variables (("GIT_SEQUENCE_EDITOR" "true"))
         (let ((status (vc-git-command buf 0 nil
-                                      "rebase" "--autostash" "--autosquash" "-i"
-                                      (format "%s~1" commit))))
+                                      "commit" (format "--fixup=%s" commit) "--no-edit")))
           (unless (zerop status)
             (pop-to-buffer buf)
-            (error "Git rebase --autosquash failed (%s)" status))))
+            (error "Git commit --fixup failed (%s)" status)))
 
-      (message "Fixup + autosquash complete for %s" commit)
-      (when (derived-mode-p 'log-view-mode)
-        (revert-buffer nil t)))))
+        (with-environment-variables (("GIT_SEQUENCE_EDITOR" "true"))
+          (let ((status (apply #'vc-git-command buf 0 nil
+                               "rebase" "--autostash" "--autosquash" "-i"
+                               (if (eq base :root) (list "--root") (list base)))))
+            (unless (zerop status)
+              (pop-to-buffer buf)
+              (error "Git rebase --autosquash failed (%s)" status))))
+
+        (message "Fixup + autosquash complete for %s" commit)
+        (when (derived-mode-p 'log-view-mode)
+          (revert-buffer nil t))))))
 
 (provide 'czm-vc)
 ;;; czm-vc.el ends here
