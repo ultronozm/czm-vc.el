@@ -241,14 +241,15 @@ The default is `vc-log-show-limit' if > 0."
 (defun czm-vc-log-view-copy-revision-or-range-as-kill ()
   "Copy commit at point, or copy commit range when region is active."
   (interactive)
-  (if-let* ((_region (use-region-p))
-            (top (cadr (log-view-current-entry (region-beginning))))
-            (bottom (cadr (log-view-current-entry (region-end))))
-            ((not (equal top bottom))))
-      (let ((range (format "%s..%s" bottom top)))
-        (deactivate-mark)
-        (kill-new range)
-        (message "Copied \"%s\" to kill ring." range))
+  (if (use-region-p)
+      (if-let* ((top (cadr (log-view-current-entry (region-beginning))))
+                (bottom (cadr (log-view-current-entry (region-end))))
+                ((not (equal top bottom))))
+          (let ((range (format "%s..%s" bottom top)))
+            (deactivate-mark)
+            (kill-new range)
+            (message "Copied \"%s\" to kill ring." range))
+        (log-view-copy-revision-as-kill))
     (log-view-copy-revision-as-kill)))
 
 ;; Originally named "stubvex-cherry-pick".
