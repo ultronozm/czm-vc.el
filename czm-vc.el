@@ -31,6 +31,7 @@
 (declare-function vc-git--assert-allowed-rewrite "vc-git" (rev))
 (declare-function vc-git--call "vc-git" (infile buffer command &rest args))
 (declare-function vc-git--empty-db-p "vc-git" ())
+(declare-function vc-git-root "vc-git" (file))
 (declare-function vc-create-repo "vc" (backend &optional directory))
 (declare-function vc-read-revision "vc" (prompt &optional files backend default initial-input))
 (declare-function vc-print-root-log "vc" (&optional limit))
@@ -43,6 +44,7 @@
 (declare-function log-view-current-tag "log-view" ())
 (declare-function log-view-current-entry "log-view" (&optional pos move))
 (declare-function log-view-copy-revision-as-kill "log-view" ())
+(declare-function log-view-get-marked "log-view" ())
 (declare-function project-root "project" (project))
 
 (defvar vc-git-shortlog-switches)
@@ -249,6 +251,25 @@ The default is `vc-log-show-limit' if > 0."
         (message "Copied \"%s\" to kill ring." range))
     (log-view-copy-revision-as-kill)))
 
+;; Originally named "stubvex-cherry-pick".
+;;;###autoload
+(defun czm-vc-log-view-cherry-pick-marked ()
+  "Cherry-pick marked revisions in `vc-git-log-view-mode' without committing."
+  (interactive)
+  (require 'vc-git)
+  (unless (derived-mode-p 'vc-git-log-view-mode)
+    (user-error "Not in a Git log view"))
+  (let ((revisions (log-view-get-marked))
+        (buf-name "*git cherry-pick*"))
+    (unless revisions
+      (user-error "No revisions marked"))
+    (if (zerop (apply #'vc-git-command buf-name t nil
+                      "cherry-pick" "--no-commit" revisions))
+        (message "Cherry pick successful")
+      (pop-to-buffer buf-name)
+      (when (y-or-n-p "Cherry pick failed - abort? ")
+        (vc-git-command buf-name 0 nil "cherry-pick" "--abort")))))
+
 ;;;###autoload
 (defun czm-vc-embark-show-commit (commit)
   "Show COMMIT via `vc-print-branch-log', constraining it to COMMIT^!."
@@ -313,6 +334,40 @@ The default is `vc-log-show-limit' if > 0."
         (goto-char (point-min))
         (diff-mode)))
     (pop-to-buffer buffer)))
+
+;; Originally named "emacs-solo/switch-git-status-buffer".
+;;;###autoload
+(defun czm-vc-switch-to-git-status-file ()
+  "Visit a modified, renamed, or untracked file from Git status."
+  (interactive)
+  (require 'vc-git)
+  (let ((repo-root (vc-git-root default-directory)))
+    (unless repo-root
+      (user-error "Not inside a Git repository"))
+    (let* ((expanded-root (expand-file-name repo-root))
+           (cmd-output (vc-git--run-command-string nil "status" "--porcelain=v1"))
+           (target-files
+            (let (files)
+              (dolist (line (split-string cmd-output "\n" t) (nreverse files))
+                (when (>= (length line) 3)
+                  (let ((status (substring line 0 2))
+                        (path-info (substring line 3)))
+                    (cond
+                     ((string-prefix-p "R" status)
+                      (let* ((paths (split-string path-info " -> " t))
+                             (new-path (cadr paths)))
+                        (when new-path
+                          (push (cons (format "R %s" new-path) new-path) files))))
+                     ((or (string-match-p "M" status)
+                          (string-match-p "\\?\\?" status))
+                      (push (cons (format "%s %s" status path-info) path-info) files)))))))))
+      (unless target-files
+        (user-error "No modified, renamed, or untracked files found"))
+      (let* ((selection (completing-read "Switch to file (Git status): "
+                                         (mapcar #'car target-files) nil t))
+             (file-path (cdr (assoc selection target-files))))
+        (when file-path
+          (find-file (expand-file-name file-path expanded-root)))))))
 
 (defun czm-vc-git--read-fixup-commit ()
   "Read a commit (hash/ref) to fix up.
