@@ -336,38 +336,85 @@ The default is `vc-log-show-limit' if > 0."
         (diff-mode)))
     (pop-to-buffer buffer)))
 
-;; Originally named "emacs-solo/switch-git-status-buffer".
+(defun czm-vc--git-status-openable-files ()
+  "Return an alist of openable files from Git status.
+Each element is a cons cell (PATH . ANNOTATION) for files that can be
+opened directly: modified files, renamed files, and untracked files.
+Parses the output of `git status --porcelain=v1 -z'."
+  (require 'vc-git)
+  (let* ((cmd-output (vc-git--run-command-string nil "status" "--porcelain=v1" "-z"))
+         (records (split-string cmd-output "\0" t))
+         files)
+    (while records
+      (let ((entry (pop records)))
+        (when (>= (length entry) 3)
+          (let ((status (substring entry 0 2))
+                (path (substring entry 3)))
+            (cond
+             ((string-prefix-p "R" status)
+              (let ((old-path (pop records)))
+                (push (cons path
+                            (if old-path
+                                (format "  %s <- %s" status old-path)
+                              (format "  %s" status)))
+                      files)))
+             ((or (string-match-p "M" status)
+                  (string= status "??"))
+              (push (cons path (format "  %s" status)) files)))))))
+    (nreverse files)))
+
+;; Adapted from "emacs-solo/switch-git-status-buffer".
 ;;;###autoload
-(defun czm-vc-switch-to-git-status-file ()
-  "Visit a modified, renamed, or untracked file from Git status."
-  (interactive)
+(defun czm-vc-switch-to-git-status-file (&optional exportable)
+  "Visit a modified, renamed, or untracked file from Git status.
+
+With prefix argument EXPORTABLE (\\[universal-argument]), use file-category
+completion metadata so `embark-export' can export the narrowed candidates to
+Dired.  Without a prefix argument, show status markers inline in candidates."
+  (interactive "P")
   (require 'vc-git)
   (let ((repo-root (vc-git-root default-directory)))
     (unless repo-root
       (user-error "Not inside a Git repository"))
-    (let* ((expanded-root (expand-file-name repo-root))
-           (cmd-output (vc-git--run-command-string nil "status" "--porcelain=v1"))
-           (target-files
-            (let (files)
-              (dolist (line (split-string cmd-output "\n" t) (nreverse files))
-                (when (>= (length line) 3)
-                  (let ((status (substring line 0 2))
-                        (path-info (substring line 3)))
-                    (cond
-                     ((string-prefix-p "R" status)
-                      (let* ((paths (split-string path-info " -> " t))
-                             (new-path (cadr paths)))
-                        (when new-path
-                          (push (cons (format "R %s" new-path) new-path) files))))
-                     ((or (string-match-p "M" status)
-                          (string-match-p "\\?\\?" status))
-                      (push (cons (format "%s %s" status path-info) path-info) files)))))))))
+    (let* ((expanded-root (file-name-as-directory (expand-file-name repo-root)))
+           (default-directory expanded-root)
+           (target-files (czm-vc--git-status-openable-files)))
       (unless target-files
         (user-error "No modified, renamed, or untracked files found"))
-      (let* ((selection (completing-read "Switch to file (Git status): "
-                                         (mapcar #'car target-files) nil t))
-             (file-path (cdr (assoc selection target-files))))
-        (when file-path
+      (if exportable
+          (let* ((annotations target-files)
+                 (candidates (mapcar #'car target-files))
+                 (table
+                  (lambda (string pred action)
+                    (if (eq action 'metadata)
+                        `(metadata
+                          (category . file)
+                          (display-sort-function . identity)
+                          (cycle-sort-function . identity)
+                          (annotation-function
+                           . ,(lambda (candidate)
+                                (or (cdr (assoc candidate annotations)) ""))))
+                      (complete-with-action action candidates string pred))))
+                 (selection (completing-read "Switch to file (Git status): "
+                                             table nil t)))
+            (find-file (expand-file-name selection expanded-root)))
+        (let* ((display-to-file
+                (mapcar (lambda (entry)
+                          (let* ((path (car entry))
+                                 (annotation (string-trim-left (cdr entry)))
+                                 (parts (split-string annotation " <- " t))
+                                 (status (string-trim (car parts)))
+                                 (old-path (cadr parts))
+                                 (display (if old-path
+                                              (format "%s %s <- %s" status path old-path)
+                                            (format "%s %s" status path))))
+                            (cons display path)))
+                        target-files))
+               (selection (completing-read "Switch to file (Git status): "
+                                           (mapcar #'car display-to-file) nil t))
+               (file-path (cdr (assoc selection display-to-file))))
+          (unless file-path
+            (user-error "No file selected"))
           (find-file (expand-file-name file-path expanded-root)))))))
 
 (defun czm-vc-git--read-fixup-commit ()
