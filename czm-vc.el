@@ -33,6 +33,7 @@
 (declare-function vc-git--empty-db-p "vc-git" ())
 (declare-function vc-git-root "vc-git" (file))
 (declare-function vc-create-repo "vc" (backend &optional directory))
+(declare-function vc-default-cherry-pick-comment "vc" (backend rev comment))
 (declare-function vc-read-revision "vc" (prompt &optional files backend default initial-input))
 (declare-function vc-print-root-log "vc" (&optional limit))
 (declare-function vc-print-branch-log "vc" (working-revision &optional verbose))
@@ -513,6 +514,33 @@ where BASE is COMMIT's parent, or `--root' if COMMIT is a root commit."
         (message "Fixup + autosquash complete for %s" commit)
         (when (derived-mode-p 'log-view-mode)
           (revert-buffer nil t))))))
+
+(defvar log-edit-comment-ring)
+
+(defun czm-vc-git--recent-reset-p ()
+  "Return non-nil when the latest HEAD reflog entry is a reset."
+  (ignore-errors
+    (string-prefix-p
+     "reset:"
+     (car (process-lines "git" "reflog" "-1" "--format=%gs" "HEAD")))))
+
+;;;###autoload
+(defun czm-vc-git-log-edit-add-orig-head-to-future-history ()
+  "Expose ORIG_HEAD commit message as first \\`M-n' in `log-edit-mode'."
+  (require 'vc)
+  (when (and (derived-mode-p 'vc-git-log-edit-mode)
+             (czm-vc-git--recent-reset-p)
+             (ignore-errors
+               (process-lines "git" "rev-parse" "-q" "--verify"
+                              "ORIG_HEAD^{commit}")))
+    (let ((comment
+           (ignore-errors
+             (string-trim-right
+              (vc-default-cherry-pick-comment nil "ORIG_HEAD" nil)))))
+      (when (and (stringp comment)
+                 (not (string-empty-p comment))
+                 (not (ring-member log-edit-comment-ring comment)))
+        (ring-insert-at-beginning log-edit-comment-ring comment)))))
 
 (provide 'czm-vc)
 ;;; czm-vc.el ends here
