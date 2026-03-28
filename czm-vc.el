@@ -49,10 +49,21 @@
 (declare-function project-root "project" (project))
 
 (defvar vc-git-shortlog-switches)
+(defvar vc-git-program)
+(defvar vc-prefix-map)
 (defvar vc-revert-show-diff)
 (defvar vc-suppress-confirm)
 (defvar embark-keymap-alist)
 (defvar embark-target-finders)
+
+(defcustom czm-vc-git-sparse-set-use-no-cone t
+  "When non-nil, `czm-vc-git-sparse-set' uses `--no-cone'.
+This is useful for file-level sparse checkouts."
+  :type 'boolean
+  :group 'vc)
+
+(defvar czm-vc-git-sparse-path-history nil
+  "Minibuffer history for sparse-checkout file selections.")
 
 ;; Internal helpers
 (defun czm-vc--assert-git-working-tree (&optional dir)
@@ -434,6 +445,176 @@ If called from `log-view-mode', default to `log-view-current-tag'."
                    "Fixup commit: ")
                  nil nil default)))
 
+(defun czm-vc--git-root ()
+  "Return repository root for current Git worktree."
+  (let ((root (or (ignore-errors (vc-root-dir)) default-directory)))
+    (czm-vc--assert-git-working-tree root)
+    (file-name-as-directory (expand-file-name root))))
+
+(defun czm-vc--git-tracked-files ()
+  "Return tracked files at repository root, relative to that root."
+  (require 'vc-git)
+  (let ((s (vc-git--run-command-string nil "ls-files" "-z")))
+    (unless (string-empty-p (or s ""))
+      (split-string s "\0" t))))
+
+(defun czm-vc--git-sparse-enabled-p ()
+  "Return non-nil if sparse checkout is enabled in this worktree."
+  (require 'vc-git)
+  (let ((s (vc-git--run-command-string nil "config" "--bool" "--get"
+                                       "core.sparseCheckout")))
+    (string= (string-trim (or s "")) "true")))
+
+(defun czm-vc--git-sparse-list-lines ()
+  "Return sparse-checkout rules for this worktree as a list of lines."
+  (require 'vc-git)
+  (with-temp-buffer
+    (if (zerop (vc-git--call nil t "sparse-checkout" "list"))
+        (split-string (string-trim-right (buffer-string)) "\n" t)
+      nil)))
+
+(defun czm-vc--git-sparse-normalize-patterns (files)
+  "Return FILES converted to root-anchored non-cone patterns."
+  (mapcar (lambda (f)
+            (if (string-prefix-p "/" f) f (concat "/" f)))
+          files))
+
+(defun czm-vc--git-sparse-read-files (prompt)
+  "Read one or more tracked files for sparse-checkout commands."
+  (let* ((root (czm-vc--git-root))
+         (default-directory root)
+         (files (czm-vc--git-tracked-files))
+         (default (when-let* ((file (buffer-file-name))
+                              ((file-in-directory-p file root)))
+                    (file-relative-name file root)))
+         raw
+         ret)
+    (unless files (user-error "No tracked files found"))
+    (setq raw (completing-read-multiple
+               (format-prompt prompt default)
+               files nil t nil
+               'czm-vc-git-sparse-path-history
+               default))
+    (dolist (f raw)
+      (setq f (string-trim f))
+      (when (and (not (string-empty-p f))
+                 (not (member f ret)))
+        (push f ret)))
+    (setq ret (nreverse ret))
+    (unless ret
+      (user-error "Select at least one file"))
+    ret))
+
+(defun czm-vc--git-sparse-run (&rest args)
+  "Run `git sparse-checkout' with ARGS and return command output."
+  (require 'vc-git)
+  (let ((buf (get-buffer-create "*czm-vc-git-sparse*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (let ((status (apply #'vc-git-command buf 0 nil "sparse-checkout" args)))
+      (unless (zerop status)
+        (pop-to-buffer buf)
+        (error "git sparse-checkout %s failed (%s)"
+               (mapconcat #'identity args " ")
+               status)))
+    (with-current-buffer buf
+      (string-trim-right (buffer-string)))))
+
+(defun czm-vc--git-sparse-run-stdin (subcommand lines &rest extra-args)
+  "Run sparse-checkout SUBCOMMAND reading newline-delimited LINES from stdin."
+  (require 'vc-git)
+  (let* ((buf (get-buffer-create "*czm-vc-git-sparse*"))
+         (args (append (list "sparse-checkout" subcommand)
+                       extra-args
+                       (list "--stdin")))
+         status)
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)))
+    (with-temp-buffer
+      (dolist (line lines)
+        (insert line "\n"))
+      (setq status
+            (apply #'call-process-region
+                   (point-min) (point-max)
+                   vc-git-program nil buf nil
+                   args)))
+    (unless (and (integerp status) (zerop status))
+      (pop-to-buffer buf)
+      (error "git sparse-checkout %s failed (%s)" subcommand status))
+    (with-current-buffer buf
+      (string-trim-right (buffer-string)))))
+
+;;;###autoload
+(defun czm-vc-git-sparse-set (files)
+  "Enable sparse-checkout and set FILES as the sparse selection."
+  (interactive (list (czm-vc--git-sparse-read-files "Sparse set files")))
+  (let* ((root (czm-vc--git-root))
+         (default-directory root)
+         (patterns (czm-vc--git-sparse-normalize-patterns files))
+         (n (length patterns)))
+    (if czm-vc-git-sparse-set-use-no-cone
+        (czm-vc--git-sparse-run-stdin "set" patterns "--no-cone")
+      (czm-vc--git-sparse-run-stdin "set" patterns))
+    (message "Sparse-checkout set to %d file%s"
+             n (if (= n 1) "" "s"))))
+
+;;;###autoload
+(defun czm-vc-git-sparse-add (files)
+  "Add FILES to the existing sparse-checkout selection."
+  (interactive (list (czm-vc--git-sparse-read-files "Sparse add files")))
+  (let* ((root (czm-vc--git-root))
+         (default-directory root)
+         (patterns (czm-vc--git-sparse-normalize-patterns files))
+         (n (length patterns)))
+    (unless (czm-vc--git-sparse-enabled-p)
+      (user-error "Sparse-checkout is not enabled; run `czm-vc-git-sparse-set' first"))
+    (czm-vc--git-sparse-run-stdin "add" patterns)
+    (message "Added %d file%s to sparse-checkout"
+             n (if (= n 1) "" "s"))))
+
+;;;###autoload
+(defun czm-vc-git-sparse-disable ()
+  "Disable sparse-checkout for the current worktree."
+  (interactive)
+  (let* ((root (czm-vc--git-root))
+         (default-directory root))
+    (unless (czm-vc--git-sparse-enabled-p)
+      (user-error "Sparse-checkout is not enabled"))
+    (czm-vc--git-sparse-run "disable")
+    (message "Sparse-checkout disabled")))
+
+;;;###autoload
+(defun czm-vc-git-sparse-reapply ()
+  "Reapply sparse-checkout rules in the current worktree."
+  (interactive)
+  (let* ((root (czm-vc--git-root))
+         (default-directory root))
+    (unless (czm-vc--git-sparse-enabled-p)
+      (user-error "Sparse-checkout is not enabled"))
+    (czm-vc--git-sparse-run "reapply")
+    (message "Sparse-checkout reapplied")))
+
+;;;###autoload
+(defun czm-vc-git-sparse-list ()
+  "Show sparse-checkout rules for the current worktree."
+  (interactive)
+  (let* ((root (czm-vc--git-root))
+         (default-directory root)
+         (buf (get-buffer-create "*git sparse-checkout*")))
+    (unless (czm-vc--git-sparse-enabled-p)
+      (user-error "Sparse-checkout is not enabled"))
+    (let ((rules (czm-vc--git-sparse-list-lines)))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (if rules
+              (insert (mapconcat #'identity rules "\n") "\n")
+            (insert "(sparse-checkout list is empty)\n"))
+          (special-mode))))
+    (pop-to-buffer buf)))
+
 ;; Git helpers
 (defun czm-vc-git--commit-parents (commit)
   "Return a list of parent commits for COMMIT."
@@ -541,6 +722,14 @@ where BASE is COMMIT's parent, or `--root' if COMMIT is a root commit."
                  (not (string-empty-p comment))
                  (not (ring-member log-edit-comment-ring comment)))
         (ring-insert-at-beginning log-edit-comment-ring comment)))))
+
+(defvar-keymap czm-vc-git-sparse-map
+  :doc "Prefix map for sparse-checkout helpers."
+  "s" #'czm-vc-git-sparse-set
+  "a" #'czm-vc-git-sparse-add
+  "d" #'czm-vc-git-sparse-disable
+  "r" #'czm-vc-git-sparse-reapply
+  "l" #'czm-vc-git-sparse-list)
 
 (provide 'czm-vc)
 ;;; czm-vc.el ends here
