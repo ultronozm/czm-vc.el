@@ -25,6 +25,7 @@
 ;;; Code:
 
 (require 'subr-x)
+(require 'ring)
 
 (declare-function vc-git--run-command-string "vc-git" (file &rest args))
 (declare-function vc-git-command "vc-git" (buffer okstatus file-or-list &rest flags))
