@@ -46,7 +46,7 @@
 (declare-function vc-default-cherry-pick-comment "vc" (backend rev comment))
 (declare-function vc-read-revision "vc" (prompt &optional files backend default initial-input))
 (declare-function vc-print-root-log "vc" (&optional limit))
-(declare-function vc-print-branch-log "vc" (working-revision &optional verbose))
+(declare-function vc-print-root-branch-log "vc" (branch))
 (declare-function vc-revert "vc" (&optional file rev))
 (declare-function vc-root-dir "vc" (&optional dir))
 (declare-function vc-responsible-backend "vc" (file))
@@ -320,17 +320,15 @@ The default is `vc-log-show-limit' if > 0."
 
 ;;;###autoload
 (defun czm-vc-embark-show-commit (commit)
-  "Show COMMIT via `vc-print-branch-log', constraining it to COMMIT^!."
+  "Show COMMIT via `vc-print-root-branch-log', limited to COMMIT^!."
   (interactive (list (or (thing-at-point 'symbol t)
                          (read-string "Commit: "))))
   (require 'vc)
   (let* ((root (or (ignore-errors (vc-root-dir)) default-directory))
          (default-directory root)
-         (trimmed (czm-vc--assert-safe-git-revision commit))
-         (range (if (string-suffix-p "^!" trimmed)
-                    trimmed
-                  (concat trimmed "^!"))))
-    (vc-print-branch-log range)))
+         (revision (czm-vc--assert-safe-git-revision
+                    (string-remove-suffix "^!" (string-trim commit)))))
+    (vc-print-root-branch-log (concat revision "^!"))))
 
 ;;;###autoload
 (defun czm-vc-embark-copy-commit (commit)
