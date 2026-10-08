@@ -58,7 +58,15 @@
 (declare-function log-view-copy-revision-as-kill "log-view" ())
 (declare-function log-view-get-marked "log-view" ())
 (declare-function project-root "project" (project))
+(declare-function diff-find-file-name "diff-mode" (&optional old noprompt prefix))
+(declare-function diff-beginning-of-hunk "diff-mode" (&optional try-harder))
+(declare-function vc-version-ediff "vc" (files rev1 rev2))
+(declare-function ediff-get-diff-posn "ediff-util" (buf-type pos &optional n control-buf))
+(declare-function ediff-jump-to-difference "ediff-util" (difference-number))
 
+(defvar diff-vc-revisions)
+(defvar ediff-buffer-B)
+(defvar ediff-number-of-differences)
 (defvar vc-git-shortlog-switches)
 (defvar vc-git-program)
 (defvar vc-remote-location-history)
@@ -421,6 +429,45 @@ The default is `vc-log-show-limit' if > 0."
         (goto-char (point-min))
         (diff-mode)))
     (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun czm-vc-diff-ediff-hunk ()
+  "Start Ediff on the file of the current hunk, positioned at that hunk.
+Works in unified diff buffers made by VC, such as those from
+\\[vc-diff] and \\[vc-root-diff], which record the compared
+revisions in `diff-vc-revisions'.  Ediff compares the file at the
+old revision with the file at the new revision (or the working tree)."
+  (interactive)
+  (require 'diff-mode)
+  (require 'ediff)
+  (unless (bound-and-true-p diff-vc-revisions)
+    (user-error "Not a VC diff buffer"))
+  (let* ((file (expand-file-name (diff-find-file-name)))
+         (line (save-excursion
+                 (diff-beginning-of-hunk t)
+                 (if (looking-at "@@ -[0-9,]+ \\+\\([0-9]+\\)")
+                     (string-to-number (match-string 1))
+                   (user-error "Unified diffs only"))))
+         (rev1 (nth 0 diff-vc-revisions))
+         (rev2 (nth 1 diff-vc-revisions)))
+    (vc-version-ediff (list file) rev1 rev2)
+    (when-let* ((control (seq-find (lambda (buf)
+                                     (provided-mode-derived-p
+                                      (buffer-local-value 'major-mode buf)
+                                      'ediff-mode))
+                                   (buffer-list))))
+      (with-current-buffer control
+        (let* ((pos (with-current-buffer ediff-buffer-B
+                      (save-excursion
+                        (goto-char (point-min))
+                        (forward-line (1- line))
+                        (point))))
+               (n (seq-position
+                   (number-sequence 0 (1- ediff-number-of-differences))
+                   t
+                   (lambda (i _)
+                     (>= (ediff-get-diff-posn 'B 'end i) pos)))))
+          (when n (ediff-jump-to-difference (1+ n))))))))
 
 (defun czm-vc--git-status-openable-files ()
   "Return an alist of openable files from Git status.
