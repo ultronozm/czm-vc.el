@@ -46,6 +46,7 @@
 (declare-function vc-default-cherry-pick-comment "vc" (backend rev comment))
 (declare-function vc-read-revision "vc" (prompt &optional files backend default initial-input))
 (declare-function vc-print-root-log "vc" (&optional limit))
+(declare-function vc-root-log-incoming "vc" (&optional upstream-location))
 (declare-function vc-print-root-branch-log "vc" (branch))
 (declare-function vc-revert "vc" (&optional file rev))
 (declare-function vc-root-dir "vc" (&optional dir))
@@ -60,6 +61,7 @@
 
 (defvar vc-git-shortlog-switches)
 (defvar vc-git-program)
+(defvar vc-remote-location-history)
 (defvar vc-prefix-map)
 (defvar vc-revert-show-diff)
 (defvar vc-suppress-confirm)
@@ -260,6 +262,45 @@ The patch is saved in the project root directory and opened in a buffer."
                   (user-error "Failed to stage non-whitespace changes"))
                 (revert-buffer nil t))
             (delete-file patch-file)))))))
+
+(defun czm-vc--git-remote-branch-names ()
+  "Return locally known remote branch names, excluding symbolic refs.
+This does not contact any remotes."
+  (require 'vc-git)
+  (with-temp-buffer
+    (vc-git-command
+     t 0 nil "for-each-ref"
+     "--format=%(if)%(symref)%(then)%(else)%(refname:short)%(end)"
+     "refs/remotes/")
+    (split-string (buffer-string) "\n" t)))
+
+;;;###autoload
+(defun czm-vc-root-log-incoming (&optional upstream-location)
+  "Show incoming changes from UPSTREAM-LOCATION using VC.
+With a prefix argument, prompt for the upstream, completing locally
+known remote branches for Git.  Symbolic refs such as origin/HEAD
+are excluded.  Empty input uses VC's default upstream; input need
+not match a completion candidate.  Other backends use VC's prompt.
+
+As with VC's incoming command, changes are relative to the current
+branch, and displaying them may fetch from the selected remote."
+  (interactive
+   (progn
+     (require 'vc)
+     (list
+      (when current-prefix-arg
+        (let ((location
+               (if (eq (vc-responsible-backend default-directory) 'Git)
+                   (completing-read
+                    "Upstream location/branch (empty for default): "
+                    (czm-vc--git-remote-branch-names) nil nil nil
+                    'vc-remote-location-history)
+                 (read-string
+                  "Upstream location/branch (empty for default): "
+                  nil 'vc-remote-location-history))))
+          (unless (string-empty-p location) location))))))
+  (require 'vc)
+  (vc-root-log-incoming upstream-location))
 
 ;;;###autoload
 (defun czm-vc-root-shortlog-all (&optional limit)
