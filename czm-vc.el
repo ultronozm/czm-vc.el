@@ -27,6 +27,15 @@
 (require 'subr-x)
 (require 'ring)
 
+(declare-function slot-value "eieio" (object slot-name))
+(declare-function forge-current-pullreq "forge-pullreq" (&optional demand))
+(declare-function forge-read-pullreq "forge-pullreq" (prompt))
+(declare-function forge-get-pullreq "forge-pullreq" (pullreq))
+(declare-function forge-get-repository "forge-repo" (&optional demand remote demand-remote))
+(declare-function forge-get-worktree "forge-repo" (repo))
+(declare-function magit-rev-verify "magit-git" (rev))
+(declare-function vc-diff-mergebase "vc" (files rev1 rev2))
+
 (declare-function vc-git--run-command-string "vc-git" (file &rest args))
 (declare-function vc-git-command "vc-git" (buffer okstatus file-or-list &rest flags))
 (declare-function vc-git--assert-allowed-rewrite "vc-git" (rev))
@@ -65,6 +74,31 @@ This is useful for file-level sparse checkouts."
 
 (defvar czm-vc-git-sparse-path-history nil
   "Minibuffer history for sparse-checkout file selections.")
+
+;;;###autoload
+(defun czm-vc-forge-diff-pullreq ()
+  "Show the current Forge pull request using VC's merge-base diff.
+Use the pull request at point or being visited, or prompt with
+Forge completion.  Compare its fetched head with the merge base
+of its target branch on the forge remote.  Fetch the refs first;
+this command neither fetches nor checks out the pull request."
+  (interactive)
+  (require 'forge)
+  (require 'vc)
+  (let* ((pr (or (forge-current-pullreq)
+                 (forge-get-pullreq
+                  (forge-read-pullreq "Review pull-request"))))
+         (repo (forge-get-repository pr))
+         (default-directory
+          (or (forge-get-worktree repo)
+              (user-error "No local worktree for this pull request")))
+         (remote (slot-value repo 'remote))
+         (base (concat remote "/" (slot-value pr 'base-ref)))
+         (head (format "refs/pullreqs/%s" (slot-value pr 'number))))
+    (unless (and (magit-rev-verify base) (magit-rev-verify head))
+      (user-error "Fetch %s with the pull-request refspec enabled first"
+                  remote))
+    (vc-diff-mergebase nil base head)))
 
 ;; Internal helpers
 (defun czm-vc--assert-git-working-tree (&optional dir)
